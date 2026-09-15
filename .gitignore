@@ -1,0 +1,19 @@
+# build artefacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.exe
+
+# data: input samples supplied with the task and program output
+*.tsv
+*.bin
+
+# python helpers
+__pycache__/
+*.pyc
+
+# editors
+.vscode/
+.idea/
+*.swp
