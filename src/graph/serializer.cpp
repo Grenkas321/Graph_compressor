@@ -1,5 +1,7 @@
 #include "serializer.h"
 
+#include "vertex_set.h"
+
 #include "../codec/bit_tree.h"
 #include "../codec/integer_model.h"
 #include "../codec/range_coder.h"
@@ -52,11 +54,11 @@ namespace {
                    : WEIGHT_CODING_DIRECT;
     }
 
-    // The adjacency gaps are conditioned on two values known to both sides:
-    // the expected gap length, quantized to SUB_BUCKET_COUNT steps per binary
+    // The adjacency steps are conditioned on two values known to both sides:
+    // the expected step length, quantized to SUB_BUCKET_COUNT steps per binary
     // octave, and the number of neighbours that are still to be coded.  The
     // first selects the scale of the distribution, the second its shape --
-    // with many neighbours left the gaps are noticeably less dispersed than a
+    // with many neighbours left the steps are noticeably less dispersed than a
     // geometric law would suggest.
     const size_t SUB_BUCKET_BITS = 2;
     const size_t SUB_BUCKET_COUNT = static_cast<size_t>(1) << SUB_BUCKET_BITS;
@@ -131,26 +133,37 @@ void TGraphSerializer::Serialize(const TGraph& graph, TByteOutput& output) const
 
     // 3. The adjacency lists.  The length of the list of a vertex is not
     //    stored: it equals the number of its edges that have not been seen
-    //    yet, which the decoder derives from the degrees.
+    //    yet, which the decoder derives from the degrees.  A target is coded
+    //    by its rank among the vertices that can still take an edge, so the
+    //    vertices whose edges are all accounted for cost nothing.
+    TVertexSet usable(vertexCount);
     std::vector<ui32> remaining = degrees;
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
         const ui32 listLength = remaining[vertex];
-        ui64 position = vertex;
+        ui64 passed = usable.CountBelow(vertex);
         for (ui32 i = 0; i < listLength; ++i) {
             const ui32 left = listLength - i;
-            const ui64 expectedGap = (vertexCount - position) / left;
+            const ui64 reachable = usable.GetMemberCount() - passed;
             const ui32 target = targets[offsets[vertex] + i];
-            models.Gap.Encode(encoder, MakeGapContext(expectedGap, left), target - position);
+            const ui64 below = usable.CountBelow(target);
+            models.Gap.Encode(encoder, MakeGapContext(reachable / left, left), below - passed);
             const ui8 weight = weights[offsets[vertex] + i];
             if (weightCoding == WEIGHT_CODING_ADAPTIVE) {
                 EncodeWithBitTree(encoder, models.Weight.data(), WEIGHT_BITS, weight);
             } else {
                 encoder.EncodeDirectBits(weight, WEIGHT_BITS);
             }
-            position = static_cast<ui64>(target) + 1;
-            if (target != vertex) {
-                --remaining[target];
+            if (target != vertex && --remaining[target] == 0) {
+                usable.Remove(target);
             }
+            // The next target is above the current one, so the members that
+            // have been passed are those below it plus the target itself if
+            // it is still able to take an edge.
+            passed = below + (usable.Contains(target) ? 1 : 0);
+        }
+        // The lists of the vertices that follow can no longer reach this one.
+        if (usable.Contains(vertex)) {
+            usable.Remove(vertex);
         }
     }
 
@@ -193,23 +206,29 @@ TGraph TGraphDeserializer::Deserialize(TByteInput& input) const {
     targets.reserve(edgeCount);
     weights.reserve(edgeCount);
 
+    TVertexSet usable(vertexCount);
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
         const ui32 listLength = remaining[vertex];
-        ui64 position = vertex;
+        ui64 passed = usable.CountBelow(vertex);
         for (ui32 i = 0; i < listLength; ++i) {
-            Y_ENSURE(position < vertexCount, "the compressed graph is damaged: an adjacency list overflows");
             const ui32 left = listLength - i;
-            const ui64 expectedGap = (vertexCount - position) / left;
-            const ui64 target = position + models.Gap.Decode(decoder, MakeGapContext(expectedGap, left));
-            Y_ENSURE(target < vertexCount, "the compressed graph is damaged: a vertex index is out of range");
+            const ui64 reachable = usable.GetMemberCount() - passed;
+            Y_ENSURE(reachable >= left, "the compressed graph is damaged: an adjacency list overflows");
+            const ui64 rank = models.Gap.Decode(decoder, MakeGapContext(reachable / left, left));
+            Y_ENSURE(rank + left <= reachable, "the compressed graph is damaged: a vertex rank is out of range");
+            const ui64 below = passed + rank;
+            const size_t target = usable.Select(below);
             targets.push_back(static_cast<ui32>(target));
             weights.push_back(static_cast<ui8>(weightCoding == WEIGHT_CODING_ADAPTIVE
                                                    ? DecodeWithBitTree(decoder, models.Weight.data(), WEIGHT_BITS)
                                                    : decoder.DecodeDirectBits(WEIGHT_BITS)));
-            position = target + 1;
-            if (target != vertex) {
-                --remaining[target];
+            if (target != vertex && --remaining[target] == 0) {
+                usable.Remove(target);
             }
+            passed = below + (usable.Contains(target) ? 1 : 0);
+        }
+        if (usable.Contains(vertex)) {
+            usable.Remove(vertex);
         }
         offsets[vertex + 1] = targets.size();
     }
