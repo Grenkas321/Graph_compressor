@@ -70,6 +70,23 @@ public:
         }
     }
 
+    // Encodes a single bit with a probability the caller has computed.  No
+    // state is kept: the format uses this where the probability is derived
+    // from the graph itself rather than learned.
+    void EncodeBitWithProbability(ui32 probability, ui32 bit) {
+        const ui32 bound = (Range_ >> NRangeCoder::PROBABILITY_BITS) * probability;
+        if (bit == 0) {
+            Range_ = bound;
+        } else {
+            Low_ += bound;
+            Range_ -= bound;
+        }
+        while (Range_ < NRangeCoder::TOP_VALUE) {
+            Range_ <<= 8;
+            ShiftLow();
+        }
+    }
+
     // Encodes bitCount low bits of the value assuming a uniform distribution.
     void EncodeDirectBits(ui32 value, size_t bitCount) {
         for (size_t i = bitCount; i-- > 0;) {
@@ -123,6 +140,22 @@ public:
         }
         counter += counter < NRangeCoder::COUNTER_LIMIT ? 1 : 0;
         state = (counter << NRangeCoder::COUNTER_SHIFT) | probability;
+        Normalize();
+        return bit;
+    }
+
+    // The counterpart of TRangeEncoder::EncodeBit with a given probability.
+    ui32 DecodeBitWithProbability(ui32 probability) {
+        const ui32 bound = (Range_ >> NRangeCoder::PROBABILITY_BITS) * probability;
+        ui32 bit;
+        if (Code_ < bound) {
+            Range_ = bound;
+            bit = 0;
+        } else {
+            Code_ -= bound;
+            Range_ -= bound;
+            bit = 1;
+        }
         Normalize();
         return bit;
     }

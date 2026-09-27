@@ -1,8 +1,10 @@
 #include "serializer.h"
 
-#include "vertex_set.h"
+#include "weight_tree.h"
 
+#include "../codec/binomial.h"
 #include "../codec/bit_tree.h"
+#include "../codec/calibrator.h"
 #include "../codec/integer_model.h"
 #include "../codec/range_coder.h"
 #include "../common/bit_utils.h"
@@ -55,57 +57,13 @@ namespace {
                    : WEIGHT_CODING_DIRECT;
     }
 
-    // The adjacency steps are conditioned on two values known to both sides:
-    // the expected step length, quantized to SUB_BUCKET_COUNT steps per binary
-    // octave, and the number of neighbours that are still to be coded.  The
-    // first selects the scale of the distribution, the second its shape --
-    // with many neighbours left the steps are noticeably less dispersed than a
-    // geometric law would suggest.
-    const size_t SUB_BUCKET_BITS = 2;
-    const size_t SUB_BUCKET_COUNT = static_cast<size_t>(1) << SUB_BUCKET_BITS;
-    const size_t LEFT_BUCKET_COUNT = 4;
-    const size_t GAP_CONTEXT_COUNT = 33 * SUB_BUCKET_COUNT * LEFT_BUCKET_COUNT;
-
-    size_t MakeGapContext(ui64 expectedGap, ui32 left) noexcept {
-        const size_t exponent = GetBitLength(expectedGap) - 1;
-        size_t fraction = 0;
-        if (exponent >= SUB_BUCKET_BITS) {
-            fraction = static_cast<size_t>((expectedGap >> (exponent - SUB_BUCKET_BITS)) & (SUB_BUCKET_COUNT - 1));
-        }
-        size_t leftBucket = GetBitLength(left) - 1;
-        if (leftBucket >= LEFT_BUCKET_COUNT) {
-            leftBucket = LEFT_BUCKET_COUNT - 1;
-        }
-        return (exponent * SUB_BUCKET_COUNT + fraction) * LEFT_BUCKET_COUNT + leftBucket;
-    }
-
-    // Holds every adaptive model used by the format.  Both directions create
-    // it in the same state, which is what keeps them synchronized.
-    struct TModels {
-        TModels()
-            : VertexId(1)
-            , Degree(1)
-            , Gap(GAP_CONTEXT_COUNT)
-            , Weight(WEIGHT_SLOTS, NRangeCoder::INITIAL_STATE)
-        {
-        }
-
-        TIntegerModel VertexId;
-        TIntegerModel Degree;
-        TIntegerModel Gap;
-        std::vector<TBitState> Weight;
-    };
-
     // The order in which the adjacency lists are coded: falling degree, ties
     // broken by the vertex index.
     //
-    // The rank model treats every vertex that can still take an edge as
-    // equally likely, but an edge lands on a vertex with a chance that grows
-    // with the number of edges that vertex still owes, and the degrees follow
-    // a power law.  Coding the lists in this order turns that weight into a
-    // position: the vertices an edge is likely to reach are gathered at the
-    // front, the ranks become small, and the adaptive model learns the shape
-    // on its own.
+    // An edge lands on a vertex with a chance that grows with the number of
+    // edges that vertex still owes, and the degrees follow a power law.  This
+    // order puts the vertices an edge is likely to reach at the front, which
+    // is what makes the halves of a split differ enough to be worth coding.
     //
     // The order costs nothing to transmit.  The identifiers and the degrees
     // are coded in the order of the identifiers, and the degrees precede the
@@ -137,7 +95,8 @@ namespace {
 
     // The adjacency lists in the coding order.  Every edge sits at the
     // endpoint that comes first in that order, and the weight travels in the
-    // low byte of the target so that one sort orders a list.
+    // low byte of the target so that one sort orders a list and a comparison
+    // against a shifted bound still compares targets.
     struct TCodingView {
         std::vector<ui64> Offsets;
         std::vector<ui64> Targets;
@@ -180,6 +139,193 @@ namespace {
         }
         return view;
     }
+
+    // The context a split is calibrated in.  A split is described by how many
+    // vertices it has to choose from, by how far the weights move it away
+    // from plain counting, and by how many targets it distributes.
+    const size_t SIZE_CLASSES = 8;
+    const size_t DISCREPANCY_CLASSES = 9;
+    const size_t WIDTH_CLASSES = 4;
+    const size_t CALIBRATION_CONTEXTS = SIZE_CLASSES * DISCREPANCY_CLASSES * WIDTH_CLASSES;
+
+    size_t MakeWidthClass(size_t width) noexcept {
+        if (width <= 1) {
+            return 0;
+        }
+        if (width == 2) {
+            return 1;
+        }
+        return width <= 4 ? 2 : 3;
+    }
+
+    size_t MakeSplitContext(ui32 available, ui32 weightProbability, ui32 countProbability,
+                            size_t width) noexcept {
+        size_t size = GetBitLength(available);
+        if (size >= SIZE_CLASSES) {
+            size = SIZE_CLASSES - 1;
+        }
+
+        // The stretch scale is 512, and the classes span two natural log odds
+        // in each direction.
+        int difference = TCalibrator::GetStretch(weightProbability)
+                       - TCalibrator::GetStretch(countProbability);
+        if (difference < -1024) {
+            difference = -1024;
+        }
+        if (difference > 1023) {
+            difference = 1023;
+        }
+        const size_t discrepancy = static_cast<size_t>((difference + 1024) / 256);
+
+        return (size * DISCREPANCY_CLASSES + discrepancy) * WIDTH_CLASSES + MakeWidthClass(width);
+    }
+
+    ui32 MakeProbability(ui64 left, ui64 right) noexcept {
+        ui64 probability = (left << NRangeCoder::PROBABILITY_BITS) / (left + right);
+        if (probability < 1) {
+            probability = 1;
+        }
+        if (probability > NRangeCoder::PROBABILITY_TOTAL - 1) {
+            probability = NRangeCoder::PROBABILITY_TOTAL - 1;
+        }
+        return static_cast<ui32>(probability);
+    }
+
+    // Holds every adaptive model used by the format.  Both directions create
+    // it in the same state, which is what keeps them synchronized.
+    struct TModels {
+        TModels()
+            : VertexId(1)
+            , Degree(1)
+            , Calibration(CALIBRATION_CONTEXTS)
+            , Weight(WEIGHT_SLOTS, NRangeCoder::INITIAL_STATE)
+        {
+        }
+
+        TIntegerModel VertexId;
+        TIntegerModel Degree;
+        TCalibrator Calibration;
+        TBinomial Binomial;
+        std::vector<TBitState> Weight;
+    };
+
+    // Everything a split needs, computed the same way by both directions.
+    struct TSplit {
+        size_t Context;
+        ui32 Position;
+        ui32 Probability;
+    };
+
+    TSplit PrepareSplit(TModels& models, const TWeightTree& tree, size_t node,
+                        ui32 available, size_t width) {
+        const size_t leftNode = 2 * node;
+        const size_t rightNode = leftNode + 1;
+        const ui64 leftWeight = tree.GetWeight(leftNode);
+        const ui64 rightWeight = tree.GetWeight(rightNode);
+        const ui32 weightProbability = MakeProbability(leftWeight, rightWeight);
+        const ui32 countProbability = MakeProbability(tree.GetCount(leftNode),
+                                                      tree.GetCount(rightNode));
+
+        TSplit split;
+        split.Context = MakeSplitContext(available, weightProbability, countProbability, width);
+        split.Position = TCalibrator::GetPosition(weightProbability);
+        split.Probability = models.Calibration.Apply(split.Context, split.Position,
+                                                     leftWeight, rightWeight);
+        return split;
+    }
+
+    void LearnSplit(TModels& models, const TSplit& split, size_t width, size_t left) {
+        const ui32 observed = static_cast<ui32>(
+            (static_cast<ui64>(left) << NRangeCoder::PROBABILITY_BITS) / width);
+        models.Calibration.Update(split.Context, split.Position, split.Probability,
+                                  observed, static_cast<ui32>(width));
+    }
+
+    // Codes one adjacency list by splitting the vertex range in half over and
+    // over.  Nothing is coded where the answer is forced: a half with no
+    // vertex left, a half with no target, or a range where every vertex that
+    // can still take an edge is a target.
+    void EncodeList(TRangeEncoder& encoder, TModels& models, const TWeightTree& tree,
+                    size_t node, size_t lo, size_t hi, const ui64* first, const ui64* last) {
+        const size_t width = static_cast<size_t>(last - first);
+        if (width == 0) {
+            return;
+        }
+        const ui32 available = tree.GetCount(node);
+        if (width == available || hi - lo == 1) {
+            return;
+        }
+
+        const size_t mid = (lo + hi) / 2;
+        const size_t leftNode = 2 * node;
+        const size_t rightNode = leftNode + 1;
+        if (tree.GetCount(leftNode) == 0) {
+            EncodeList(encoder, models, tree, rightNode, mid, hi, first, last);
+            return;
+        }
+        if (tree.GetCount(rightNode) == 0) {
+            EncodeList(encoder, models, tree, leftNode, lo, mid, first, last);
+            return;
+        }
+
+        const ui64* split = std::lower_bound(first, last, static_cast<ui64>(mid) << 8);
+        const size_t left = static_cast<size_t>(split - first);
+
+        const TSplit prepared = PrepareSplit(models, tree, node, available, width);
+        if (width == 1) {
+            encoder.EncodeBitWithProbability(prepared.Probability, left == 1 ? 0 : 1);
+        } else {
+            models.Binomial.Build(width, prepared.Probability);
+            models.Binomial.Encode(encoder, left);
+        }
+        LearnSplit(models, prepared, width, left);
+
+        EncodeList(encoder, models, tree, leftNode, lo, mid, first, split);
+        EncodeList(encoder, models, tree, rightNode, mid, hi, split, last);
+    }
+
+    void DecodeList(TRangeDecoder& decoder, TModels& models, const TWeightTree& tree,
+                    size_t node, size_t lo, size_t hi, size_t width, std::vector<ui32>& out) {
+        if (width == 0) {
+            return;
+        }
+        const ui32 available = tree.GetCount(node);
+        Y_ENSURE(width <= available, "the compressed graph is damaged: an adjacency list overflows");
+        if (width == available) {
+            tree.Collect(node, lo, hi, out);
+            return;
+        }
+        if (hi - lo == 1) {
+            out.push_back(static_cast<ui32>(lo));
+            return;
+        }
+
+        const size_t mid = (lo + hi) / 2;
+        const size_t leftNode = 2 * node;
+        const size_t rightNode = leftNode + 1;
+        if (tree.GetCount(leftNode) == 0) {
+            DecodeList(decoder, models, tree, rightNode, mid, hi, width, out);
+            return;
+        }
+        if (tree.GetCount(rightNode) == 0) {
+            DecodeList(decoder, models, tree, leftNode, lo, mid, width, out);
+            return;
+        }
+
+        const TSplit prepared = PrepareSplit(models, tree, node, available, width);
+        size_t left;
+        if (width == 1) {
+            left = decoder.DecodeBitWithProbability(prepared.Probability) == 0 ? 1 : 0;
+        } else {
+            models.Binomial.Build(width, prepared.Probability);
+            left = models.Binomial.Decode(decoder);
+        }
+        Y_ENSURE(left <= width, "the compressed graph is damaged: a split is out of range");
+        LearnSplit(models, prepared, width, left);
+
+        DecodeList(decoder, models, tree, leftNode, lo, mid, left, out);
+        DecodeList(decoder, models, tree, rightNode, mid, hi, width - left, out);
+    }
 } // namespace
 
 void TGraphSerializer::Serialize(const TGraph& graph, TByteOutput& output) const {
@@ -216,11 +362,9 @@ void TGraphSerializer::Serialize(const TGraph& graph, TByteOutput& output) const
     }
 
     // 3. The adjacency lists, in the order of falling degree.  The length of
-    //    the list of a vertex is not stored: it equals the number of its edges
+    //    a list is not stored: it equals the number of edges of that vertex
     //    that have not been seen yet, which the decoder derives from the
-    //    degrees.  A target is coded by its rank among the vertices that can
-    //    still take an edge, so the vertices whose edges are all accounted for
-    //    cost nothing.
+    //    degrees.
     const std::vector<ui32> order = MakeCodingOrder(degrees);
     std::vector<ui32> codingIndex(vertexCount);
     std::vector<ui32> remaining(vertexCount);
@@ -230,34 +374,36 @@ void TGraphSerializer::Serialize(const TGraph& graph, TByteOutput& output) const
     }
     const TCodingView view = MakeCodingView(graph, codingIndex);
 
-    TVertexSet usable(vertexCount);
+    TWeightTree tree(remaining);
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
-        const ui32 listLength = remaining[vertex];
-        ui64 passed = usable.CountBelow(vertex);
-        for (ui32 i = 0; i < listLength; ++i) {
-            const ui32 left = listLength - i;
-            const ui64 reachable = usable.GetMemberCount() - passed;
-            const ui64 packed = view.Targets[view.Offsets[vertex] + i];
-            const ui32 target = static_cast<ui32>(packed >> 8);
-            const ui64 below = usable.CountBelow(target);
-            models.Gap.Encode(encoder, MakeGapContext(reachable / left, left), below - passed);
-            const ui8 weight = static_cast<ui8>(packed & 0xFF);
+        const ui64 begin = view.Offsets[vertex];
+        const ui64 end = view.Offsets[vertex + 1];
+        if (begin != end) {
+            EncodeList(encoder, models, tree, 1, 0, tree.GetSpan(),
+                       view.Targets.data() + begin, view.Targets.data() + end);
+        }
+
+        // The weights follow the list, in the order of the targets, which
+        // both sides know once the list itself is out.
+        for (ui64 i = begin; i < end; ++i) {
+            const ui8 weight = static_cast<ui8>(view.Targets[i] & 0xFF);
             if (weightCoding == WEIGHT_CODING_ADAPTIVE) {
                 EncodeWithBitTree(encoder, models.Weight.data(), WEIGHT_BITS, weight);
             } else {
                 encoder.EncodeDirectBits(weight, WEIGHT_BITS);
             }
-            if (target != vertex && --remaining[target] == 0) {
-                usable.Remove(target);
-            }
-            // The next target is above the current one, so the members that
-            // have been passed are those below it plus the target itself if
-            // it is still able to take an edge.
-            passed = below + (usable.Contains(target) ? 1 : 0);
         }
-        // The lists of the vertices that follow can no longer reach this one.
-        if (usable.Contains(vertex)) {
-            usable.Remove(vertex);
+
+        for (ui64 i = begin; i < end; ++i) {
+            const ui32 target = static_cast<ui32>(view.Targets[i] >> 8);
+            if (target != vertex && --remaining[target] == 0) {
+                tree.Set(target, 0, 0);
+            } else if (target != vertex) {
+                tree.Set(target, 1, remaining[target]);
+            }
+        }
+        if (tree.GetCount(tree.GetSpan() + vertex) != 0) {
+            tree.Set(vertex, 0, 0);
         }
     }
 
@@ -301,42 +447,42 @@ TGraph TGraphDeserializer::Deserialize(TByteInput& input) const {
         remaining[i] = degrees[order[i]];
     }
 
-    // The edges arrive in the coding order and are collected as pairs of
-    // identifier indices, which is what the graph is built from.
     std::vector<ui32> sources(edgeCount);
     std::vector<ui64> packedTargets(edgeCount);
     ui64 decoded = 0;
 
-    TVertexSet usable(vertexCount);
+    TWeightTree tree(remaining);
+    std::vector<ui32> list;
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
         const ui32 listLength = remaining[vertex];
-        ui64 passed = usable.CountBelow(vertex);
-        for (ui32 i = 0; i < listLength; ++i) {
-            const ui32 left = listLength - i;
-            const ui64 reachable = usable.GetMemberCount() - passed;
-            Y_ENSURE(reachable >= left, "the compressed graph is damaged: an adjacency list overflows");
-            const ui64 rank = models.Gap.Decode(decoder, MakeGapContext(reachable / left, left));
-            Y_ENSURE(rank + left <= reachable, "the compressed graph is damaged: a vertex rank is out of range");
-            const ui64 below = passed + rank;
-            const size_t target = usable.Select(below);
+        list.clear();
+        if (listLength != 0) {
+            DecodeList(decoder, models, tree, 1, 0, tree.GetSpan(), listLength, list);
+        }
+        Y_ENSURE(list.size() == listLength, "the compressed graph is damaged: a list is incomplete");
+        Y_ENSURE(decoded + listLength <= edgeCount, "the compressed graph is damaged: too many edges");
+
+        for (size_t i = 0; i < list.size(); ++i) {
             const ui8 weight = static_cast<ui8>(weightCoding == WEIGHT_CODING_ADAPTIVE
                                                     ? DecodeWithBitTree(decoder, models.Weight.data(), WEIGHT_BITS)
                                                     : decoder.DecodeDirectBits(WEIGHT_BITS));
-
-            Y_ENSURE(decoded < edgeCount, "the compressed graph is damaged: too many edges");
             const ui32 first = order[vertex];
-            const ui32 second = order[target];
+            const ui32 second = order[list[i]];
             sources[decoded] = first < second ? first : second;
             packedTargets[decoded] = (static_cast<ui64>(first < second ? second : first) << 8) | weight;
             ++decoded;
-
-            if (target != vertex && --remaining[target] == 0) {
-                usable.Remove(target);
-            }
-            passed = below + (usable.Contains(target) ? 1 : 0);
         }
-        if (usable.Contains(vertex)) {
-            usable.Remove(vertex);
+
+        for (size_t i = 0; i < list.size(); ++i) {
+            const ui32 target = list[i];
+            if (target != vertex && --remaining[target] == 0) {
+                tree.Set(target, 0, 0);
+            } else if (target != vertex) {
+                tree.Set(target, 1, remaining[target]);
+            }
+        }
+        if (tree.GetCount(tree.GetSpan() + vertex) != 0) {
+            tree.Set(vertex, 0, 0);
         }
     }
     Y_ENSURE(decoded == edgeCount, "the compressed graph is damaged: the edge count does not match");
