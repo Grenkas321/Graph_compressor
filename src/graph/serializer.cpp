@@ -5,6 +5,7 @@
 #include "../codec/binomial.h"
 #include "../codec/bit_tree.h"
 #include "../codec/calibrator.h"
+#include "../codec/frequency_tree.h"
 #include "../codec/integer_model.h"
 #include "../codec/range_coder.h"
 #include "../common/bit_utils.h"
@@ -24,6 +25,9 @@ namespace {
     const size_t COUNTER_BITS = 32;
     const size_t WEIGHT_BITS = 8;
     const size_t WEIGHT_SLOTS = static_cast<size_t>(1) << WEIGHT_BITS;
+
+    // The identifiers live in [0, 2^32).
+    const ui64 ID_SPACE = static_cast<ui64>(1) << 32;
 
     // How the edge weights are coded.  The statement promises uniformly
     // distributed weights, and for such data raw bits are slightly cheaper
@@ -146,7 +150,9 @@ namespace {
     const size_t SIZE_CLASSES = 8;
     const size_t DISCREPANCY_CLASSES = 9;
     const size_t WIDTH_CLASSES = 4;
-    const size_t CALIBRATION_CONTEXTS = SIZE_CLASSES * DISCREPANCY_CLASSES * WIDTH_CLASSES;
+    const size_t SPAN_CLASSES = 8;
+    const size_t CALIBRATION_CONTEXTS =
+        SIZE_CLASSES * DISCREPANCY_CLASSES * WIDTH_CLASSES * SPAN_CLASSES;
 
     size_t MakeWidthClass(size_t width) noexcept {
         if (width <= 1) {
@@ -159,10 +165,18 @@ namespace {
     }
 
     size_t MakeSplitContext(ui32 available, ui32 weightProbability, ui32 countProbability,
-                            size_t width) noexcept {
+                            size_t width, size_t span) noexcept {
         size_t size = GetBitLength(available);
         if (size >= SIZE_CLASSES) {
             size = SIZE_CLASSES - 1;
+        }
+
+        // How much of the range is still alive: in this order the free
+        // vertices are far from evenly spread, so the length of the range and
+        // the number of vertices in it say different things.
+        size_t spanClass = GetBitLength(span) - GetBitLength(available);
+        if (spanClass >= SPAN_CLASSES) {
+            spanClass = SPAN_CLASSES - 1;
         }
 
         // The stretch scale is 512, and the classes span two natural log odds
@@ -177,7 +191,8 @@ namespace {
         }
         const size_t discrepancy = static_cast<size_t>((difference + 1024) / 256);
 
-        return (size * DISCREPANCY_CLASSES + discrepancy) * WIDTH_CLASSES + MakeWidthClass(width);
+        return ((size * DISCREPANCY_CLASSES + discrepancy) * WIDTH_CLASSES + MakeWidthClass(width))
+                   * SPAN_CLASSES + spanClass;
     }
 
     ui32 MakeProbability(ui64 left, ui64 right) noexcept {
@@ -195,14 +210,12 @@ namespace {
     // it in the same state, which is what keeps them synchronized.
     struct TModels {
         TModels()
-            : VertexId(1)
-            , Degree(1)
+            : Degree(1)
             , Calibration(CALIBRATION_CONTEXTS)
             , Weight(WEIGHT_SLOTS, NRangeCoder::INITIAL_STATE)
         {
         }
 
-        TIntegerModel VertexId;
         TIntegerModel Degree;
         TCalibrator Calibration;
         TBinomial Binomial;
@@ -217,7 +230,7 @@ namespace {
     };
 
     TSplit PrepareSplit(TModels& models, const TWeightTree& tree, size_t node,
-                        ui32 available, size_t width) {
+                        ui32 available, size_t width, size_t span) {
         const size_t leftNode = 2 * node;
         const size_t rightNode = leftNode + 1;
         const ui64 leftWeight = tree.GetWeight(leftNode);
@@ -227,7 +240,8 @@ namespace {
                                                       tree.GetCount(rightNode));
 
         TSplit split;
-        split.Context = MakeSplitContext(available, weightProbability, countProbability, width);
+        split.Context = MakeSplitContext(available, weightProbability, countProbability,
+                                         width, span);
         split.Position = TCalibrator::GetPosition(weightProbability);
         split.Probability = models.Calibration.Apply(split.Context, split.Position,
                                                      leftWeight, rightWeight);
@@ -239,6 +253,57 @@ namespace {
             (static_cast<ui64>(left) << NRangeCoder::PROBABILITY_BITS) / width);
         models.Calibration.Update(split.Context, split.Position, split.Probability,
                                   observed, static_cast<ui32>(width));
+    }
+
+    // Codes the identifiers by splitting the whole identifier space in half
+    // over and over, the same way an adjacency list is coded.
+    //
+    // The statement promises the identifiers are uniform, so the halves are
+    // equally likely and no model is needed at all: the count that falls on
+    // the left is binomial with probability one half.  The cost then comes
+    // out at log2 C(2^32, N), the information there actually is in a set of N
+    // identifiers, which an adaptive model of the gaps only approaches.
+    //
+    // Nothing is coded where the answer is forced: an empty side, a side with
+    // no identifiers, or a range every value of which is an identifier.
+    void EncodeIdentifiers(TRangeEncoder& encoder, TBinomial& binomial,
+                           ui64 lo, ui64 hi, const ui32* first, const ui32* last) {
+        const size_t width = static_cast<size_t>(last - first);
+        if (width == 0 || width == hi - lo || hi - lo == 1) {
+            return;
+        }
+        const ui64 mid = lo + (hi - lo) / 2;
+        const ui32* split = std::lower_bound(first, last, static_cast<ui32>(mid));
+        const size_t left = static_cast<size_t>(split - first);
+        binomial.Build(width, NRangeCoder::PROBABILITY_TOTAL / 2,
+                       static_cast<ui32>(mid - lo), static_cast<ui32>(hi - mid));
+        binomial.Encode(encoder, left);
+        EncodeIdentifiers(encoder, binomial, lo, mid, first, split);
+        EncodeIdentifiers(encoder, binomial, mid, hi, split, last);
+    }
+
+    void DecodeIdentifiers(TRangeDecoder& decoder, TBinomial& binomial,
+                           ui64 lo, ui64 hi, size_t width, std::vector<ui32>& out) {
+        if (width == 0) {
+            return;
+        }
+        if (width == hi - lo) {
+            for (ui64 value = lo; value < hi; ++value) {
+                out.push_back(static_cast<ui32>(value));
+            }
+            return;
+        }
+        if (hi - lo == 1) {
+            out.push_back(static_cast<ui32>(lo));
+            return;
+        }
+        const ui64 mid = lo + (hi - lo) / 2;
+        binomial.Build(width, NRangeCoder::PROBABILITY_TOTAL / 2,
+                       static_cast<ui32>(mid - lo), static_cast<ui32>(hi - mid));
+        const size_t left = binomial.Decode(decoder);
+        Y_ENSURE(left <= width, "the compressed graph is damaged: an identifier split is out of range");
+        DecodeIdentifiers(decoder, binomial, lo, mid, left, out);
+        DecodeIdentifiers(decoder, binomial, mid, hi, width - left, out);
     }
 
     // Codes one adjacency list by splitting the vertex range in half over and
@@ -271,11 +336,12 @@ namespace {
         const ui64* split = std::lower_bound(first, last, static_cast<ui64>(mid) << 8);
         const size_t left = static_cast<size_t>(split - first);
 
-        const TSplit prepared = PrepareSplit(models, tree, node, available, width);
+        const TSplit prepared = PrepareSplit(models, tree, node, available, width, hi - lo);
         if (width == 1) {
             encoder.EncodeBitWithProbability(prepared.Probability, left == 1 ? 0 : 1);
         } else {
-            models.Binomial.Build(width, prepared.Probability);
+            models.Binomial.Build(width, prepared.Probability,
+                                  tree.GetCount(leftNode), tree.GetCount(rightNode));
             models.Binomial.Encode(encoder, left);
         }
         LearnSplit(models, prepared, width, left);
@@ -312,12 +378,13 @@ namespace {
             return;
         }
 
-        const TSplit prepared = PrepareSplit(models, tree, node, available, width);
+        const TSplit prepared = PrepareSplit(models, tree, node, available, width, hi - lo);
         size_t left;
         if (width == 1) {
             left = decoder.DecodeBitWithProbability(prepared.Probability) == 0 ? 1 : 0;
         } else {
-            models.Binomial.Build(width, prepared.Probability);
+            models.Binomial.Build(width, prepared.Probability,
+                                  tree.GetCount(leftNode), tree.GetCount(rightNode));
             left = models.Binomial.Decode(decoder);
         }
         Y_ENSURE(left <= width, "the compressed graph is damaged: a split is out of range");
@@ -346,19 +413,25 @@ void TGraphSerializer::Serialize(const TGraph& graph, TByteOutput& output) const
     const EWeightCoding weightCoding = ChooseWeightCoding(weights);
     encoder.EncodeDirectBits(static_cast<ui32>(weightCoding), 1);
 
-    // 1. The sorted identifiers, as the gaps between the neighbouring ones.
-    ui64 previousId = 0;
-    for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
-        const ui64 id = vertexIds[vertex];
-        models.VertexId.Encode(encoder, 0, vertex == 0 ? id : id - previousId - 1);
-        previousId = id;
-    }
+    // 1. The sorted identifiers.
+    EncodeIdentifiers(encoder, models.Binomial, 0, ID_SPACE,
+                      vertexIds.data(), vertexIds.data() + vertexCount);
 
     // 2. The degrees.  They are at least one because isolated vertices do not
-    //    occur in the input format.
+    //    occur in the input format.  The largest of them opens the range the
+    //    adaptive distribution is kept over.
     const std::vector<ui32>& degrees = graph.GetDegrees();
+    ui32 maxDegree = 1;
+    for (ui32 degree : degrees) {
+        if (degree > maxDegree) {
+            maxDegree = degree;
+        }
+    }
+    models.Degree.Encode(encoder, 0, maxDegree - 1);
+
+    TFrequencyTree degreeModel(maxDegree);
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
-        models.Degree.Encode(encoder, 0, degrees[vertex] - 1);
+        degreeModel.Encode(encoder, degrees[vertex] - 1);
     }
 
     // 3. The adjacency lists, in the order of falling degree.  The length of
@@ -425,19 +498,20 @@ TGraph TGraphDeserializer::Deserialize(TByteInput& input) const {
     const EWeightCoding weightCoding = static_cast<EWeightCoding>(decoder.DecodeDirectBits(1));
     Y_ENSURE(vertexCount > 0, "the compressed graph declares no vertices");
 
-    std::vector<ui32> vertexIds(vertexCount);
-    ui64 previousId = 0;
-    for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
-        const ui64 gap = models.VertexId.Decode(decoder, 0);
-        const ui64 id = vertex == 0 ? gap : previousId + gap + 1;
-        Y_ENSURE(id <= 0xFFFFFFFFull, "the compressed graph is damaged: a vertex identifier overflows");
-        vertexIds[vertex] = static_cast<ui32>(id);
-        previousId = id;
-    }
+    std::vector<ui32> vertexIds;
+    vertexIds.reserve(vertexCount);
+    DecodeIdentifiers(decoder, models.Binomial, 0, ID_SPACE, vertexCount, vertexIds);
+    Y_ENSURE(vertexIds.size() == vertexCount,
+             "the compressed graph is damaged: the identifiers are incomplete");
+
+    const ui64 maxDegree = models.Degree.Decode(decoder, 0) + 1;
+    Y_ENSURE(maxDegree > 0 && maxDegree <= vertexCount,
+             "the compressed graph is damaged: the largest degree is out of range");
 
     std::vector<ui32> degrees(vertexCount);
+    TFrequencyTree degreeModel(static_cast<size_t>(maxDegree));
     for (size_t vertex = 0; vertex < vertexCount; ++vertex) {
-        degrees[vertex] = static_cast<ui32>(models.Degree.Decode(decoder, 0) + 1);
+        degrees[vertex] = static_cast<ui32>(degreeModel.Decode(decoder) + 1);
     }
 
     // The same permutation the encoder used, rebuilt from the degrees alone.

@@ -25,7 +25,12 @@ class TBinomial {
 public:
     // Prepares the distribution of the count for a split of the given width
     // whose probability of going left is p, in units of 1 / 2^16.
-    void Build(size_t width, ui32 probability) {
+    //
+    // A half can hold no more targets than it has vertices left, so the count
+    // is confined to a range both sides can compute.  Narrowing the search to
+    // that range costs nothing to code and, where the range collapses to one
+    // value, the count is not coded at all.
+    void Build(size_t width, ui32 probability, ui32 leftRoom, ui32 rightRoom) {
         Cumulative_.assign(width + 2, 0.0);
         Weights_.assign(width + 1, 0.0);
 
@@ -61,12 +66,14 @@ public:
         for (size_t i = 0; i <= width; ++i) {
             Cumulative_[i + 1] = Cumulative_[i] + Weights_[i] + FLOOR;
         }
-        Width_ = width;
+
+        Lowest_ = width > rightRoom ? width - rightRoom : 0;
+        Highest_ = width < leftRoom ? width : leftRoom;
     }
 
     void Encode(TRangeEncoder& encoder, size_t count) const {
-        size_t lo = 0;
-        size_t hi = Width_;
+        size_t lo = Lowest_;
+        size_t hi = Highest_;
         while (lo < hi) {
             const size_t mid = lo + (hi - lo) / 2;
             const ui32 probability = LowerProbability(lo, mid, hi);
@@ -81,8 +88,8 @@ public:
     }
 
     size_t Decode(TRangeDecoder& decoder) const {
-        size_t lo = 0;
-        size_t hi = Width_;
+        size_t lo = Lowest_;
+        size_t hi = Highest_;
         while (lo < hi) {
             const size_t mid = lo + (hi - lo) / 2;
             const ui32 probability = LowerProbability(lo, mid, hi);
@@ -123,7 +130,8 @@ private:
     }
 
 private:
-    size_t Width_ = 0;
+    size_t Lowest_ = 0;
+    size_t Highest_ = 0;
     std::vector<double> Weights_;
     std::vector<double> Cumulative_;
 };

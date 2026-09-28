@@ -113,7 +113,7 @@ private:
     // outcome and never comes back.
     static const int DELTA_BITS = 28;
     static const i32 DELTA_LIMIT = 4 << DELTA_BITS;
-    static const size_t BUCKET_COUNT = 65;
+    static const size_t BUCKET_COUNT = 129;
     static const int RANGE = 13 * 512;          // the stretch scale is 512
     static const int FRACTION_BITS = 8;
     static const int SCALE_BITS = 16;
